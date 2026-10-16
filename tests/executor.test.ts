@@ -24,7 +24,7 @@ import {
   type ExecutorOptions,
 } from '../src/runner/executor.js';
 import { describeAction, StepRecovery } from '../src/runner/recovery.js';
-import { captureSnapshot, trimSnapshot } from '../src/runner/snapshot.js';
+import { captureSnapshot, snapshotCutAt, trimSnapshot } from '../src/runner/snapshot.js';
 import type { TestFile } from '../src/runner/testfile.js';
 
 // --- fakes -----------------------------------------------------------------
@@ -347,6 +347,9 @@ function baseOptions(brain: AgentBrain, overrides: Partial<ExecutorOptions> = {}
     baseUrl: 'http://x.test',
     timeoutMs: DEFAULT_TEST_TIMEOUT_MS,
     snapshot: async () => 'snap',
+    // A `fail` with nothing done would otherwise watch a page that never
+    // changes for 3 s; the tests of that look set their own window.
+    renderWatchMs: 0,
     ...overrides,
   };
 }
@@ -1255,7 +1258,7 @@ describe('the accessibility snapshot cap is configurable', () => {
     const snap = await captureSnapshot(fakePage as unknown as Page);
     const lines = snap.split('\n');
     expect(lines).toHaveLength(1 + 200 + 1); // url line + 200 kept + truncation note
-    expect(snap).toContain('truncated after 200 lines');
+    expect(snap).toContain('lines omitted: max_snapshot_lines is 200');
   });
 
   it('a raised cap admits more lines than the default', async () => {
@@ -1264,7 +1267,7 @@ describe('the accessibility snapshot cap is configurable', () => {
     const snap = await captureSnapshot(fakePage as unknown as Page, { maxLines: 300 });
     const lines = snap.split('\n');
     expect(lines).toHaveLength(1 + 250); // every line admitted, no truncation
-    expect(snap).not.toContain('truncated');
+    expect(snap).not.toContain('omitted');
   });
 
   it("executeTest's default snapshotter honours maxSnapshotLines, unset behaves exactly as before", async () => {
@@ -1313,7 +1316,113 @@ describe('the accessibility snapshot cap is configurable', () => {
       maxSnapshotLines: 10,
     });
 
-    expect(seenSnapshot).toContain('truncated after 10 lines');
+    expect(seenSnapshot).toContain('lines omitted: max_snapshot_lines is 10');
+  });
+
+  it('a step that fails on a cut snapshot names max_snapshot_lines in its reason (#162)', async () => {
+    const failing: AgentBrain = {
+      async nextAction() {
+        return { action: 'fail', reasoning: 'no Command Bar combobox on the page' };
+      },
+      async judge() {
+        return { pass: false, reason: 'n/a' };
+      },
+    };
+    const run = async (lines: number) => {
+      const page = new FakePage();
+      page.snapshotYaml = Array.from({ length: lines }, (_, i) => `- text "line ${i}"`).join('\n');
+      return executeTest(page, makeTest(), {
+        brain: failing,
+        sessionDir,
+        baseUrl: 'http://x.test',
+        timeoutMs: DEFAULT_TEST_TIMEOUT_MS,
+        maxSnapshotLines: 10,
+        renderWatchMs: 0,
+      });
+    };
+
+    const cut = await run(50);
+    expect(cut.status).toBe('failed');
+    expect(cut.reason).toContain('no Command Bar combobox on the page');
+    expect(cut.reason).toContain("The page's snapshot was cut at max_snapshot_lines (10)");
+
+    const whole = await run(5);
+    expect(whole.status).toBe('failed');
+    expect(whole.reason).not.toContain('max_snapshot_lines');
+  });
+});
+
+// --- a page still rendering (look-again-before-failing-on-a-page-still-rendering, #14)
+
+describe('a fail with nothing done looks at the page again', () => {
+  const fail = (reasoning: string): AgentAction => ({ action: 'fail', reasoning });
+  /** A page whose start screen is complete only from the `after`th snapshot on. */
+  const rendering = (after: number) => {
+    let taken = 0;
+    return async () => (++taken < after ? '- link "Set up sync"' : '- button "Try the demo"\n- link "Set up sync"');
+  };
+
+  it('asks again on a page that changed, and the step can then pass', async () => {
+    const brain = scriptedBrain([fail('no "Try the demo" button, only a "Set up sync" link'), ...finishes()]);
+    const events: ExecutorEvent[] = [];
+    const result = await executeTest(
+      new FakePage(),
+      makeTest(),
+      baseOptions(brain, { snapshot: rendering(3), renderWatchMs: 2_000, onEvent: (e) => events.push(e) }),
+    );
+    expect(result.status).toBe('passed');
+    expect(brain.calls).toBe(3);
+    const first = events.find((e) => e.type === 'action');
+    expect(first?.type === 'action' && first.result).toContain('not accepted yet: the page changed');
+  });
+
+  it('accepts the fail on a still page, with no further model call', async () => {
+    const brain = scriptedBrain([fail('no such button')]);
+    const startedAt = Date.now();
+    const result = await executeTest(new FakePage(), makeTest(), baseOptions(brain, { renderWatchMs: 300 }));
+    expect(result.status).toBe('failed');
+    expect(result.reason).toBe('no such button');
+    expect(brain.calls).toBe(1);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+  });
+
+  it('accepts a fail after an action at once', async () => {
+    const brain = scriptedBrain([{ action: 'press', value: 'Escape', reasoning: 'r' }, fail('the dialog did not close')]);
+    const startedAt = Date.now();
+    const result = await executeTest(
+      new FakePage(),
+      makeTest(),
+      baseOptions(brain, { snapshot: rendering(2), renderWatchMs: 2_000 }),
+    );
+    expect(result.status).toBe('failed');
+    expect(brain.calls).toBe(2);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('looks only once per step', async () => {
+    let taken = 0;
+    const brain = scriptedBrain([fail('first'), fail('second')]);
+    const result = await executeTest(
+      new FakePage(),
+      makeTest(),
+      // Every snapshot differs, so a second look would also find a change.
+      baseOptions(brain, { snapshot: async () => `- text: ${++taken}`, renderWatchMs: 2_000 }),
+    );
+    expect(result.status).toBe('failed');
+    expect(result.reason).toBe('second');
+    expect(brain.calls).toBe(2);
+  });
+
+  it('does not take a re-render under new refs for a change', async () => {
+    let taken = 0;
+    const brain = scriptedBrain([fail('no such button')]);
+    const result = await executeTest(
+      new FakePage(),
+      makeTest(),
+      baseOptions(brain, { snapshot: async () => `- link "Set up sync" [ref=e${++taken}]`, renderWatchMs: 300 }),
+    );
+    expect(result.status).toBe('failed');
+    expect(brain.calls).toBe(1);
   });
 });
 
@@ -1339,7 +1448,103 @@ describe('trimSnapshot', () => {
     const yaml = Array.from({ length: 30 }, (_, i) => `- text "line ${i}"`).join('\n');
     const trimmed = trimSnapshot(yaml, 10);
     expect(trimmed.split('\n')).toHaveLength(11);
-    expect(trimmed).toContain('truncated after 10 lines');
+    expect(trimmed).toContain('lines omitted: max_snapshot_lines is 10');
+  });
+
+  // A portal-shaped page (#162): a long page, then the dialog its last action
+  // opened, rendered at the end of <body>.
+  const page = (bodyLines: number, dialog: string[]): string =>
+    [
+      '- banner:',
+      '  - heading "Budget" [level=1] [ref=e1]',
+      '- main:',
+      ...Array.from({ length: bodyLines }, (_, i) => `  - row "row ${i}" [ref=r${i}]`),
+      ...dialog,
+    ].join('\n');
+  const palette = [
+    '- dialog "Command Bar":',
+    '  - generic "Command Bar" [ref=e39]:',
+    '    - combobox "Command Bar" [expanded] [active] [ref=e41]',
+    '    - listbox "Suggestions" [ref=e42]:',
+    '      - option "Budget" [ref=e43]',
+  ];
+
+  it('keeps a dialog rendered at the end of a long page, within the cap (#162)', () => {
+    const trimmed = trimSnapshot(page(600, palette), 20);
+    const kept = trimmed.split('\n').filter((line) => !line.includes('omitted'));
+    expect(kept).toHaveLength(20);
+    for (const line of palette) expect(trimmed).toContain(line);
+    // The rest of the cap is filled from the top, in document order.
+    expect(trimmed.startsWith('- banner:\n  - heading "Budget"')).toBe(true);
+    expect(trimmed.indexOf('row "row 0"')).toBeLessThan(trimmed.indexOf('- dialog "Command Bar"'));
+    expect(trimmed).toMatch(/^ {2}- \.\.\. \(\d+ lines omitted: max_snapshot_lines is 20\)$/m);
+  });
+
+  it('keeps the focused element and the lines it sits under, outside any dialog', () => {
+    const yaml = [
+      '- main:',
+      ...Array.from({ length: 100 }, (_, i) => `  - row "row ${i}" [ref=r${i}]`),
+      '  - grid "Transactions" [ref=g1]:',
+      '    - row "new" [ref=g2]:',
+      '      - textbox "Payee" [active] [ref=g3]',
+      ...Array.from({ length: 100 }, (_, i) => `    - row "old ${i}" [ref=o${i}]`),
+    ].join('\n');
+    const trimmed = trimSnapshot(yaml, 15);
+    expect(trimmed).toContain('  - grid "Transactions" [ref=g1]:\n    - row "new" [ref=g2]:\n      - textbox "Payee" [active] [ref=g3]');
+    expect(trimmed.split('\n').filter((line) => !line.includes('omitted'))).toHaveLength(15);
+  });
+
+  it('takes the last dialog first when two are open', () => {
+    const first = ['- dialog "Settings":', ...Array.from({ length: 10 }, (_, i) => `  - checkbox "option ${i}"`)];
+    const last = ['- alertdialog "Delete account?":', '  - button "Delete"', '  - button "Cancel"'];
+    const trimmed = trimSnapshot(page(100, [...first, ...last]), 6);
+    for (const line of last) expect(trimmed).toContain(line);
+    expect(trimmed).toContain('- dialog "Settings":');
+  });
+
+  it('puts the focused element before a dialog opened earlier', () => {
+    const yaml = [
+      '- main:',
+      ...Array.from({ length: 50 }, (_, i) => `  - row "row ${i}"`),
+      '  - textbox "Search" [active]',
+      '- dialog "Settings":',
+      ...Array.from({ length: 10 }, (_, i) => `  - checkbox "option ${i}"`),
+      '- alertdialog "Delete account?":',
+      '  - button "Delete"',
+      '  - button "Cancel"',
+    ].join('\n');
+    const trimmed = trimSnapshot(yaml, 6);
+    expect(trimmed).toContain('- alertdialog "Delete account?":\n  - button "Delete"\n  - button "Cancel"');
+    expect(trimmed).toContain('  - textbox "Search" [active]');
+    expect(trimmed).not.toContain('option 0');
+  });
+
+  it('keeps the first lines of a dialog larger than the cap', () => {
+    const big = ['- dialog "Huge":', ...Array.from({ length: 50 }, (_, i) => `  - checkbox "option ${i}"`)];
+    const trimmed = trimSnapshot(page(100, big), 10);
+    const kept = trimmed.split('\n').filter((line) => !line.includes('omitted'));
+    expect(kept).toEqual(big.slice(0, 10));
+  });
+
+  it('recognises a YAML single-quoted dialog line', () => {
+    const quoted = ["- 'dialog \"Notes on file: 1\"':", '  - button "Close"'];
+    const trimmed = trimSnapshot(page(100, quoted), 10);
+    for (const line of quoted) expect(trimmed).toContain(line);
+  });
+
+  it('does not take a role that only starts with "dialog" for one', () => {
+    const trimmed = trimSnapshot(page(100, ['- dialogue "x":', '  - button "y"']), 10);
+    expect(trimmed).not.toContain('dialogue');
+  });
+
+  it('leaves a snapshot under the cap unchanged', () => {
+    const yaml = page(5, palette);
+    expect(trimSnapshot(yaml, 200)).toBe(yaml);
+  });
+
+  it('snapshotCutAt reads the cap from the markers, and nothing from a whole page', () => {
+    expect(snapshotCutAt(trimSnapshot(page(100, palette), 20))).toBe(20);
+    expect(snapshotCutAt(trimSnapshot(page(5, palette), 20))).toBeUndefined();
   });
 });
 
@@ -2577,7 +2782,10 @@ describe('a verification step only looks (a-verification-step-only-looks, #139)'
   it('leaves an action step that verifies its outcome as it was', async () => {
     const page = new FakePage();
     page.visible.add('role:button|Add to cart');
-    const brain = scriptedBrain([click('Add to cart'), { action: 'done', reasoning: 'added' }]);
+    const brain = scriptedBrain(
+      [click('Add to cart'), { action: 'done', reasoning: 'added' }],
+      [{ pass: true, reason: 'the status says it' }],
+    );
 
     const result = await executeTest(
       page,
@@ -2587,6 +2795,124 @@ describe('a verification step only looks (a-verification-step-only-looks, #139)'
 
     expect(page.calls.some((c) => c.startsWith('click'))).toBe(true);
     expect(result.status).toBe('passed');
+  });
+});
+
+describe('a done on a step that acts and then checks is judged (judge-a-done-that-closes-a-check, #172)', () => {
+  const STEP =
+    'save the transaction by clicking "Add" and verify the first transaction has payee "Home Depot"';
+  const DONE: AgentAction = { action: 'done', reasoning: 'the first row now shows Home Depot' };
+
+  /** A brain that records what it was given, so a test can read the claim and the result. */
+  function recordingBrain(script: AgentAction[], judgments: AssertJudgment[]) {
+    const lastResults: Array<string | undefined> = [];
+    const claims: string[] = [];
+    const brain: AgentBrain = {
+      async nextAction(input) {
+        lastResults.push(input.lastResult);
+        const next = script.shift();
+        if (!next) throw new Error('script exhausted');
+        return next;
+      },
+      async judge(_step, expectation) {
+        claims.push(expectation);
+        const next = judgments.shift();
+        if (!next) throw new Error('judgment script exhausted');
+        return next;
+      },
+    };
+    return { brain, lastResults, claims };
+  }
+
+  function addPage(): FakePage {
+    const page = new FakePage();
+    page.visible.add('role:button|Add');
+    return page;
+  }
+
+  it('closes the step on a passing judgment of the done\'s sentence', async () => {
+    const { brain, claims } = recordingBrain([click('Add'), DONE], [{ pass: true, reason: 'shown' }]);
+    const events: ExecutorEvent[] = [];
+
+    const result = await executeTest(
+      addPage(),
+      makeTest({ steps: [STEP] }),
+      baseOptions(brain, { onEvent: (e) => events.push(e) }),
+    );
+
+    expect(result.status).toBe('passed');
+    expect(claims).toEqual(['the first row now shows Home Depot']);
+    const last = events.filter((e) => e.type === 'action').at(-1);
+    expect(last?.type === 'action' && last.action.action).toBe('done');
+    expect(last?.type === 'action' && last.result).toBe('ok: assertion passed: shown');
+  });
+
+  it('re-observes a failed judgment and counts one attempt, returning the judge\'s reason', async () => {
+    const { brain, lastResults } = recordingBrain(
+      [click('Add'), DONE, { action: 'fail', reasoning: 'not there' }],
+      [
+        { pass: false, reason: 'the first row shows Publix' },
+        { pass: false, reason: 'still Publix' },
+      ],
+    );
+
+    const result = await executeTest(addPage(), makeTest({ steps: [STEP] }), baseOptions(brain));
+
+    expect(result.status).toBe('failed');
+    expect(lastResults.at(-1)).toBe('assertion failed: still Publix');
+  });
+
+  it('fails the step on the retry budget when every judgment fails', async () => {
+    const { brain } = recordingBrain(
+      [click('Add'), DONE, DONE],
+      [
+        { pass: false, reason: 'a' },
+        { pass: false, reason: 'b' },
+        { pass: false, reason: 'c' },
+        { pass: false, reason: 'd' },
+      ],
+    );
+
+    const result = await executeTest(addPage(), makeTest({ steps: [STEP] }), baseOptions(brain, { maxRetries: 2 }));
+
+    expect(result.status).toBe('failed');
+    expect(result.steps[0]?.reason).toBe('d');
+  });
+
+  it('closes a step that names only an action on done, with no judgment', async () => {
+    const page = new FakePage();
+    page.visible.add('role:textbox|Note');
+    const brain = scriptedBrain([
+      { action: 'fill', target: { role: 'textbox', name: 'Note' }, value: 'Check the invoice', reasoning: 'r' },
+      { action: 'done', reasoning: 'filled' },
+    ]);
+
+    const result = await executeTest(
+      page,
+      makeTest({ steps: ['fill the note field with Check the invoice'] }),
+      baseOptions(brain),
+    );
+
+    expect(result.status).toBe('passed');
+    expect(brain.judgeCalls).toBe(0);
+  });
+
+  it('holds a setup step to the same rule', async () => {
+    const { brain, claims } = recordingBrain(
+      [click('Add'), DONE, { action: 'done', reasoning: 'main' }],
+      [{ pass: true, reason: 'shown' }],
+    );
+    const page = addPage();
+    page.visible.add('role:button|Main');
+
+    const result = await executeTest(
+      page,
+      makeTest({ setup: [STEP], steps: ['main step'] }),
+      baseOptions(brain),
+    );
+
+    expect(claims).toEqual(['the first row now shows Home Depot']);
+    expect(result.steps[0]?.setup).toBe(true);
   });
 });
 

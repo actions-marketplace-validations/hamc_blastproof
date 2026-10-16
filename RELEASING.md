@@ -26,7 +26,7 @@ git log --oneline v0.1.0..main
 
 Read that list before tagging. 0.7.0 shipped without a changelog entry because nobody did, and every other surface agreed with itself — which is exactly why the one that disagreed went unnoticed.
 
-If anything in that list changes how a step is executed or judged, run `npm run eval:reliability` on the reference pair before tagging (see [CONTRIBUTING.md](CONTRIBUTING.md#measuring-how-often-a-verdict-is-wrong)). If the README's reliability table no longer describes the release, update it.
+If anything in that list changes how a step is executed or judged, run `npm run eval:reliability` on the reference pair before tagging (see [CONTRIBUTING.md](CONTRIBUTING.md#measuring-how-often-a-verdict-is-wrong)). If the README's reliability table no longer describes the release, update it. If a reference model's numbers moved, update its row on [blastproof.dev/models](https://blastproof.dev/models) too (the `MODELS` array in `site/models.html`).
 
 The release workflow refuses to publish if the tag and the manifest version disagree, rebuilds and re-runs the full verification, and publishes with npm provenance. It needs an `NPM_TOKEN` secret on the repository.
 
@@ -55,4 +55,4 @@ Listing is manual, from the release page, because GitHub has no API for it:
 3. The metadata check must say **Everything looks good!**. Primary category **Testing**, secondary **Continuous integration**.
 4. **Update release**, then check `https://github.com/marketplace/actions/blastproof-e2e-ai-testing`.
 
-First listed with 0.25.0, on 2026-10-10. Whether a later release must tick the box again, or is picked up by the listing on its own, is not known yet: check the listing's version after the next release and record the answer here.
+First listed with 0.25.0, on 2026-10-10. This is done once, not per release: 0.26.0 was created with `gh release create --latest`, with the box never ticked, and the listing showed it as its latest version within a minute.

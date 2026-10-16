@@ -87,7 +87,15 @@ The agent acts on the element it read, not on a search for its name. Each elemen
 | `<button aria-label="Delete note">` | an icon-only button with no name |
 | `<select>` with `<option>`s | an ARIA-less custom dropdown |
 
-**An editable data grid is the shape most likely to defeat this, and every row above understates it.** Two adversarial runs against a personal-finance application failed on the journey such an application exists for — entering a transaction. The row's cells carry no accessible name, but the Payee *column header* does, so the tree does not merely lack the target: it offers a control with exactly the right name that is the wrong control. The agent clicks the header, the row editor never opens, and the next `type` lands in whatever input does exist — there, the page's global search box. The step fails describing a textbox nobody mentioned, roughly 70 model calls in. Nobody has yet tried driving such a grid by keyboard (`Tab` into the row, type, `Tab` on), so the honest claim is that **the obvious authoring fails, and fails confusingly** — not that it is impossible. If your core journey is a row editor, spend one test on it before adopting ([#67](https://github.com/hamc/blastproof/issues/67)).
+**An editable data grid needs one cell per step.** On a budgeting app's transaction register, a new row shows only the cell that has focus. The date input appears as `textbox [active]: 10/12/2026`, with no name. The empty payee and notes cells are plain `div`s, and the accessibility tree drops them. Each cell becomes a named input only once it is focused. A step asking for four values at once shows the agent one textbox, and it typed the payee into the date. Written one cell per step in keyboard order, the same journey passed:
+
+```yaml
+  - click "Add New" and verify a new transaction row is open with its date field focused
+  - press Tab to move to the payee field, type Fast Internet, and choose "Fast Internet" from the suggestions
+  - press Tab three times to move to the payment field, type 12.34, and click "Add"
+```
+
+That test failed 3 runs of 3 written as one step, and passed 3 of 3 written this way, on 0.26.0 with `claude-haiku-5.5`. On the app's side, a label on each cell's input makes the one-step version readable too. If your core journey is a row editor, spend one test on it before adopting ([#67](https://github.com/hamc/blastproof/issues/67)).
 
 **Run an accessibility checker on your app before installing anything.** The result predicts how well this will work better than anything else you could measure — and the fixes it suggests are worth making regardless of whether you adopt this tool.
 
@@ -107,7 +115,7 @@ If a critical journey needs one of these, that journey stays with your existing 
 
 **Use a seeded database, a staging environment you can reset, or a throwaway account. Do not gate on a run against production data.**
 
-Within a step, an action that commits — a click, or pressing Enter — is never performed twice: the runner refuses the repeat and tells the agent it already did that. This closes the case that used to produce duplicate records, where a submit answered by a redirect came back to a reset form and the agent, seeing no evidence of its own work, submitted again.
+Within a step, an action that commits — a click, or pressing Enter — is not performed twice: the runner refuses the repeat and tells the agent it already did that. This closes the case that used to produce duplicate records, where a submit answered by a redirect came back to a reset form and the agent, seeing no evidence of its own work, refilled it and submitted again. One repeat goes through: the same control pressed again right after itself, with nothing else done in between, when the page changed after the last press — a tour's "Next", a wizard, "load more".
 
 It is **not** a guarantee of zero duplicate writes. An agent that reaches the same effect by a genuinely different route — another control that does the same thing — is not caught.
 
@@ -308,15 +316,15 @@ A merge gate is judged by two numbers. A **false PASS** is a test that passes on
 | --- | --- | --- |
 | false FAIL, correct app (40 test runs) | 0 (≤ 8.8%) | 0 (≤ 8.8%) |
 | false PASS, literal bugs (30) | 0 (≤ 11.4%) | 0 (≤ 11.4%) |
-| false PASS, subtle bugs (20) | 0 (≤ 16.1%) | 0 (≤ 16.1%) |
+| false PASS, subtle bugs (20) | 0 of 19 (≤ 16.8%) | 0 (≤ 16.1%) |
 
-The bounds are 95% upper bounds: zero errors in 40 runs means "below about 9%", not "never". The first run of this table found a false PASS on Haiku, 2 subtle runs in 20. The confirmation showed order `#BP-1002`, another paragraph mentioned `#BP-1001` as a previous order, and a step checking for `#BP-1001` *in the confirmation* passed. That was fixed in the judge ([#147](https://github.com/hamc/blastproof/issues/147)), and this is the run after the fix.
+The bounds are 95% upper bounds: zero errors in 40 runs means "below about 9%", not "never". The first run of this table found a false PASS on Haiku, 2 subtle runs in 20. The confirmation showed order `#BP-1002`, another paragraph mentioned `#BP-1001` as a previous order, and a step checking for `#BP-1001` *in the confirmation* passed. That was fixed in the judge ([#147](https://github.com/hamc/blastproof/issues/147)). On 0.26.0, Haiku had one false FAIL in 40, in the notes test: the note was listed and counted, but the model had typed it into the empty field again, and the judge read the filled field as a form not yet submitted. One subtle run on Haiku ended incomplete, and is left out of its count.
 
 The demo app is small and well labelled, so these numbers flatter. Expect a real application to do worse. The point of this table is that it can be reproduced, and that every change claiming better verdicts has to move it.
 
 The same benchmark over seven more models, and why it chose the OpenAI and Ollama defaults, is in [Choosing a model](./docs/configuration.md#choosing-a-model).
 
-Measured 2026-10-07 on `main` after 0.23.0 with #147's fix, 5 samples, through OpenRouter. To reproduce:
+Measured 2026-10-13 on 0.27.0, 5 samples, through OpenRouter. To reproduce:
 
 ```bash
 npm run build
@@ -325,7 +333,7 @@ EVAL_MODELS=anthropic/claude-haiku-4.5,openai/gpt-6-luna npm run eval:reliabilit
 
 ## Development
 
-Built with AI assistance using spec-driven development: every change began as a written proposal with its design rationale, and those documents are kept rather than discarded. `openspec/` holds the reasoning behind each decision, including the alternatives that were rejected and why — start at [`AGENTS.md`](./AGENTS.md) for architecture, conventions and the contribution workflow. Open work lives in [issues](https://github.com/hamc/blastproof/issues). Where it is heading is on the [roadmap](https://github.com/users/hamc/projects/2): those issues grouped by horizon (now, next, later) and theme, with no dates.
+Built with AI assistance using spec-driven development: every change began as a written proposal with its design rationale, and those documents are kept rather than discarded. `openspec/` holds the reasoning behind each decision, including the alternatives that were rejected and why — start at [`AGENTS.md`](./AGENTS.md) for architecture, conventions and the contribution workflow. Open work lives in [issues](https://github.com/hamc/blastproof/issues).
 
 ```bash
 npm install && npm run build && npm test

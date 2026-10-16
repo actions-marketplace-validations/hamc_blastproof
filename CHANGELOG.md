@@ -5,7 +5,68 @@ while it is pre-1.0, a minor bump may change existing behaviour and a patch neve
 
 ## [Unreleased]
 
+### Documentation
+
+- Jev measured as the judge in whole runs, and not adopted: alone, it failed a correct test in every run on a real app; as a first pass in front of the LLM judge, it was as accurate, 13% cheaper and 7% faster, but a pass it gives has no reason, and its documented weaknesses (numbers, dates) are untested here ([#174](https://github.com/hamc/blastproof/issues/174)).
+
+## [0.27.0] — 2026-10-13
+
+Minor rather than patch: a step that closed on the agent's word now has its check judged, so a
+step that passed before can now fail.
+
 ### Fixed
+
+- **A step that acts and then checks has its check judged.** In a step like *"save the
+  transaction by clicking "Add" and verify the first transaction has payee "Home Depot""*, the
+  agent could answer `done` after the click, and the step closed on its own sentence about the
+  page: on a budgeting app's suite, 4 of 61 such steps closed this way, and on the demo app 5 of 35
+  on `gpt-6-luna` (#172). A check verb after `and`, `then`, a comma or a semicolon now makes that
+  `done` a claim the judge decides, as for an assertion. After the change, every such step on both
+  was judged. The suite still passed 21 of 21, the reliability benchmark found no false FAIL or
+  false PASS on either reference model, and the run cost about the same number of calls.
+
+### Documentation
+
+- **An editable data grid needs one cell per step.** The README's note on row editors now shows a
+  grid written one cell per step in keyboard order, with what was measured: the same test failed 3
+  runs of 3 written as one step, and passed 3 of 3 written this way (#67).
+- **Jev measured as a judge.** `docs/model-evaluations/jev.md` records TypeSafe AI's decision model
+  replayed on the judge corpus (#174). `evals/judge/jev.ts` measures a later version for about a
+  cent. *Corrected after release:* this entry first said 34 of 41 cases right and 6 false PASSes,
+  so not usable as a judge. That run gave Jev the step without the `[redacted NAME]` rewrite and
+  without the label check every LLM verdict gets; measured with both, Jev got 40 of 41 and no
+  false PASS. It writes no reason for a failed step, which the agent's retry reads, so it is not a
+  drop-in judge.
+
+## [0.26.0] — 2026-10-12
+
+### Fixed
+
+- **A step looks at the page again before giving up on one still rendering.** An app that
+  renders from data already in the browser goes network-idle before its first paint is done, so
+  a step could read a half-built page, and the model answered `fail` with nothing done: "no "Try
+  the demo" button, only a "Set up sync" link", in 5.6 s, on a budgeting app under
+  `concurrency: 4` (#14). Such a `fail` now waits up to 3 s for the page to change, once per
+  step. A changed page goes back to the model, and the record shows it. A still page fails as
+  before with no extra model call. On a page rendering its button 2 s after idle, the step failed 3
+  runs of 3 and now passes 3 of 3.
+
+- **A step can press the same control again when each press moves the page.** Within a step, a
+  click or Enter that already succeeded was always refused, so *"click Next until the tour shows
+  its last step"* failed on its second click (#164). The repeat now goes through when it follows
+  itself directly, with nothing else done in between, and the page changed after the last press.
+  Every other repeat is still refused, including the duplicate-record shape, where the form is
+  refilled before the second submit: on the dogfood notes test it was attempted and refused in 5
+  runs of 5. The tour passed 3 runs of 3 with all 7 clicks.
+
+- **A dialog opened at the end of a long page survives the snapshot cap.** Frameworks render
+  dialogs, menus and command palettes at the end of the page, and a snapshot over
+  `max_snapshot_lines` kept only the top, so the element the last action opened was the first
+  thing dropped. On a budgeting app's 670-line page, the command palette sat at line 606, and both
+  of its tests failed 2 runs in 2 at the default cap. A cut now keeps the open dialogs and the
+  focused element first and fills the rest from the top, and both tests passed 2 in 2. Omitted
+  lines are marked where they were, and a step that fails on a cut snapshot names
+  `max_snapshot_lines` in its reason (#162).
 
 - **A run stopped before any test executed has no score, where it reported 100.** When the
   provider refused the first call or the budget ran out during sign-in, the JUnit report, the HTML
@@ -14,6 +75,11 @@ while it is pre-1.0, a minor bump may change existing behaviour and a patch neve
   `Score: none` (#134). **Upgrade note:** a step reading `outputs.score` gets an empty string for
   that run, as it already did when no report was produced. A finished run whose selection was
   empty still scores 100.
+
+- **A call the run's deadline aborts stops as the deadline, even when its timer fires early.** A
+  Node timer can fire about a millisecond before the clock reaches its due time, and the stop was
+  then reported as a model-call timeout instead of the deadline (#159). Which limit armed the
+  timer is now decided when it is armed.
 
 ## [0.25.0] — 2026-10-10
 

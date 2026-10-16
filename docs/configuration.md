@@ -100,6 +100,8 @@ npm run build
 EVAL_MODELS=openai/gpt-oss-20b npm run eval:reliability
 ```
 
+Models that cannot take every role are measured on the role they could take. [Jev](./model-evaluations/jev.md), a decision model that generates no text, was measured as a judge: as accurate as the current judges on the judge corpus, but it writes no reason for the agent's retry to read.
+
 ### OpenAI-compatible gateways
 
 `provider: openai` plus a `base_url` reaches anything speaking the OpenAI API —
@@ -211,9 +213,17 @@ Caps how much of the accessibility tree is sent to the model per snapshot.
 Dense pages are truncated at 200 lines by default.
 
 **Truncation is always marked in the snapshot**, so the model is never misled
-into believing it saw the whole page. Raise this if your pages are genuinely
-large; the cost is tokens on every call of every step, which is the single
-largest lever on what a run spends.
+into believing it saw the whole page: each run of dropped lines is replaced by
+`- ... (N lines omitted: max_snapshot_lines is M)` where it was. A step that
+fails on a cut snapshot says so in its reason, naming this setting.
+
+A cut does not simply keep the top of the page. React, Vue and Angular render
+dialogs, menus and command palettes at the end of the page, so the open
+dialogs (the last one opened first) and the focused element are kept first,
+with what they contain, and the rest of the cap is filled from the top.
+
+Raise this if your pages are genuinely large; the cost is tokens on every call
+of every step, which is the single largest lever on what a run spends.
 
 ### `headless`
 
@@ -257,6 +267,19 @@ removes.
 
 Rewriting such a test to assert on its own note rather than the total makes it
 safe to parallelise, and is a better test regardless.
+
+### A slower machine meets the page sooner
+
+Several browsers on one machine make each page render more slowly. The runner
+waits for the network to go idle before it reads a page, but an application
+that renders from data already in the browser (local storage, IndexedDB) goes
+idle **before** its first paint is complete, so a step can read a half-built
+page. When the model then gives up on a step in which nothing was done yet,
+the runner watches the page for up to 3 seconds first. If it changed, the model
+decides again on the new page, and the record shows the second look; if it did
+not, the step fails as before, with no extra model call. That covers a first
+paint, once per step. A page that is slow for other reasons can still fail
+under concurrency where it passes alone.
 
 ### Two practical consequences
 

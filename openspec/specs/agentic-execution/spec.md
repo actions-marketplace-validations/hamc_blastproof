@@ -157,7 +157,9 @@ The executor SHALL run optional `setup` steps before the test steps, start from 
 - **THEN** the second test starts with no cookies, storage, or navigation history from the first
 
 ### Requirement: The accessibility snapshot cap is configurable
-The number of accessibility-tree lines sent to the model SHALL be configurable, defaulting to the current value. Truncation SHALL remain visible in the snapshot so the model is not misled into believing it has seen the whole page.
+The number of accessibility-tree lines sent to the model SHALL be configurable, defaulting to the current value. Truncation SHALL remain visible in the snapshot so the model is not misled into believing it has seen the whole page: each run of omitted lines SHALL be replaced in place by a line stating how many were omitted and naming `max_snapshot_lines`.
+
+A snapshot over the cap SHALL keep the open dialogs (`dialog`, `alertdialog`), the last one first, and the focused element, each with its subtree and the lines it sits under, before filling the rest of the cap from the top of the page. The kept lines SHALL NOT exceed the cap. A step that fails on a snapshot that was cut SHALL say in its reason that the snapshot was cut at `max_snapshot_lines`.
 
 #### Scenario: Default preserved
 - **WHEN** no cap is configured
@@ -169,7 +171,15 @@ The number of accessibility-tree lines sent to the model SHALL be configurable, 
 
 #### Scenario: Truncation stays visible
 - **WHEN** a snapshot is truncated at whatever cap applies
-- **THEN** the snapshot states that it was truncated
+- **THEN** the snapshot states, where lines were omitted, how many and that `max_snapshot_lines` caused it
+
+#### Scenario: A dialog rendered at the end of a long page survives the cap
+- **WHEN** a 670-line snapshot has an open dialog at line 606 and the cap is 200
+- **THEN** the dialog and its contents are in the snapshot, and the kept lines do not exceed 200
+
+#### Scenario: A failure on a cut snapshot names the cap
+- **WHEN** a step fails and the last snapshot it read was cut
+- **THEN** the step's reason says the snapshot was cut at `max_snapshot_lines`
 
 ### Requirement: A failed judgment re-observes before the model re-decides
 When an `assert` judgment fails, the executor SHALL capture a fresh snapshot and evaluate the same expectation again, at least once, before returning control to the model for a new action. Only after the same expectation has failed against a freshly settled page SHALL the model be asked what to do next.
@@ -235,6 +245,8 @@ The record of successful actions SHALL be scoped to the step and reset at every 
 
 This requirement is deliberately about repetition, not about mutation: the executor cannot tell from a role and an accessible name whether an action writes to the application, and does not attempt to. It applies to the whole step and not only to recovery after a failed judgment, because the duplicate commit does not require a judgment to have failed — the trigger is a page that has lost the evidence of what was done to it.
 
+One repeat SHALL be performed: a commit that follows its own previous success in the step, with no other action succeeding in between, when the snapshot the model decided it on differs, refs aside, from the one that previous success was decided on. A step that pages through a tour or a wizard needs that, and the measured duplicates each performed another action in between to restore the form.
+
 #### Scenario: A commit is not repeated
 - **WHEN** the model proposes a `click` identical to one that already succeeded in the same step
 - **THEN** the click is not performed, the model is told it was refused and why, and one failed attempt is spent
@@ -274,6 +286,18 @@ This requirement is deliberately about repetition, not about mutation: the execu
 #### Scenario: Refusal cannot loop
 - **WHEN** the model keeps proposing refused actions
 - **THEN** the failed attempts accumulate and the step fails on the existing retry budget
+
+#### Scenario: A control that moves the page may be pressed again
+- **WHEN** a step clicks button "Next", the page's tour counter moves from "1 of 8" to "2 of 8", and the model proposes clicking "Next" again with nothing in between
+- **THEN** the click is performed
+
+#### Scenario: Something done in between closes the exception
+- **WHEN** a step clicks button "Add note", fills the note field again, and proposes clicking "Add note" again, on a page that changed
+- **THEN** the click is refused
+
+#### Scenario: A press that did not move the page is still refused
+- **WHEN** a step clicks a button and the next snapshot, refs aside, is identical to the one before it
+- **THEN** clicking the same button again is refused
 
 ### Requirement: The model recovers with the step's own history in view
 The model SHALL receive, on every iteration of a step, the actions already performed successfully in that step together with their results, presented as a record of what it has done and not as instructions. The record SHALL be scoped to the current step, and every value in it SHALL pass through the run-wide mask exactly as the snapshot and the last result already do.
@@ -654,3 +678,44 @@ The snapshot given to the judge and to the planner SHALL carry no refs. They cho
 #### Scenario: The judge reads no ids
 - **WHEN** a step is judged
 - **THEN** the snapshot in the judge's prompt contains no `[ref=` marker
+
+### Requirement: A fail with nothing done is checked against a page still rendering
+When the model answers `fail` in a step in which no action has yet succeeded, the executor SHALL, at most once per step, watch the page for a bounded time before accepting it. If the page, refs aside, differs from the snapshot the `fail` was decided on, the `fail` SHALL NOT be accepted: the model SHALL be asked again on the current page and told why, and the record SHALL show the second look. If the page does not change within the bound, the `fail` SHALL be accepted without another model call.
+
+#### Scenario: A page still rendering is looked at again
+- **WHEN** the model answers `fail` on the first snapshot of a step because a button is not there yet, and the button appears a second later with no network activity
+- **THEN** the model is asked again on the page with the button, and the record shows the `fail` was not accepted because the page changed
+
+#### Scenario: A still page fails as before
+- **WHEN** the model answers `fail` with nothing done, and the page does not change
+- **THEN** the step fails with the model's reason, and no further model call is made for it
+
+#### Scenario: A fail after an action is accepted at once
+- **WHEN** the model answers `fail` after an action in the step succeeded
+- **THEN** the step fails without watching the page
+
+#### Scenario: Only once per step
+- **WHEN** the model answers `fail` again after its first `fail` was not accepted
+- **THEN** the second `fail` is accepted without watching the page
+
+### Requirement: A done on a step that asks for a check is judged
+
+When the model answers `done` on a step whose text contains a verification clause after its first clause (a check verb introduced by `and`, `then`, a comma or a semicolon), the executor SHALL NOT close the step on the `done`. It SHALL judge the step with the `done`'s reasoning as the claim, by the same procedure as an `assert`, re-observation on a failed judgment included. A passing judgment SHALL close the step. A failing one SHALL count as one failed attempt, with the judge's reason returned to the model.
+
+A step whose text contains no such clause SHALL close on `done` as before, and a step that starts with a check verb SHALL keep refusing `done`.
+
+#### Scenario: An act-and-verify step closed on done is judged
+- **WHEN** a step says "save the transaction by clicking "Add" and verify the first transaction has payee "Home Depot"", the click succeeds, and the model answers `done` saying the first row shows Home Depot
+- **THEN** the step is judged against the page with that sentence as the claim, and closes only if the judgment passes
+
+#### Scenario: A failing judgment of a done is a failed attempt
+- **WHEN** the judgment of such a `done` fails on the re-observed page as well
+- **THEN** the step does not close, one failed attempt is counted, and the judge's reason is the model's next result
+
+#### Scenario: A step that names only an action closes as before
+- **WHEN** a step says "fill the note field with Check the invoice", the fill succeeds, and the model answers `done`
+- **THEN** the step closes without a judgment
+
+#### Scenario: A step that only verifies still refuses done
+- **WHEN** a step begins with "verify" and the model answers `done`
+- **THEN** the `done` is refused as before

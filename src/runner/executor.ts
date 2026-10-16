@@ -13,7 +13,7 @@ import {
   type PageLike,
 } from './actions.js';
 import { referencedEnvVars } from './env.js';
-import { indexRefs, withoutRefs } from './snapshot.js';
+import { indexRefs, snapshotCutAt, withoutRefs } from './snapshot.js';
 import { StepRecovery, describeAction } from './recovery.js';
 
 /** Hard cap on LLM actions per step, when not overridden. Also the number the
@@ -47,6 +47,16 @@ export const DEFAULT_MAX_ITERATIONS_PER_STEP = 15;
  * toward today's behaviour, never toward a hang.
  */
 export const SETTLE_TIMEOUT_MS = 2_000;
+
+/**
+ * How long a `fail` with nothing done waits for the page to change before it
+ * is accepted (design look-again-before-failing-on-a-page-still-rendering, D3).
+ * `networkidle` arrives before the first paint of an app that renders from
+ * local data, so the snapshot can catch a half-built page and the model gives
+ * up on it (#14). Not a measurement: 1.5 times the settle bound.
+ */
+export const RENDER_WATCH_MS = 3_000;
+const RENDER_POLL_MS = 250;
 
 /**
  * Waits for the page to settle before the caller takes a snapshot, bounded by
@@ -155,6 +165,8 @@ export interface ExecutorOptions {
    * own default (200 lines).
    */
   maxSnapshotLines?: number;
+  /** How long a `fail` with nothing done watches the page; tests shorten it. */
+  renderWatchMs?: number;
   onEvent?: (event: ExecutorEvent) => void;
 }
 
@@ -197,11 +209,42 @@ const NOTHING_DONE_REFUSAL =
   'left to do — assert that it holds and let the judgment close the step; an assertion is evidence, ' +
   'a declaration is not. If the step cannot be carried out at all, fail it and say why.';
 
+/**
+ * The result a `fail` gets when the page changed after the snapshot it was
+ * decided on (design look-again-before-failing-on-a-page-still-rendering, D3).
+ */
+const FAIL_ON_A_CHANGING_PAGE =
+  'not accepted yet: the page changed after the snapshot you answered fail on, so it may still have been ' +
+  'loading. Decide again on the page as it is now.';
+
 const VERIFICATION_DONE_REFUSAL =
   'refused: this step only verifies, so it closes on a passing assertion, not on being declared finished. ' +
   'Assert what the page shows; if it does not show what the step names, fail the step and say why.';
 
 class StepFailure extends Error {}
+
+/**
+ * Re-snapshots until the page differs from `seen`, for up to `withinMs`, and
+ * returns the changed page, or `undefined` when it stayed still (design
+ * look-again-before-failing-on-a-page-still-rendering, D3). Compared as the
+ * model's judge reads it, masked and without refs, because refs are ids.
+ */
+async function pageChangedWithin(
+  page: PageLike,
+  takeSnapshot: (page: PageLike) => Promise<string>,
+  view: (snapshot: string) => string,
+  seen: string,
+  withinMs: number,
+): Promise<{ raw: string; page: string } | undefined> {
+  const deadline = Date.now() + withinMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(RENDER_POLL_MS, Math.max(0, deadline - Date.now()))));
+    const raw = await takeSnapshot(page);
+    const current = view(raw);
+    if (current !== seen) return { raw, page: current };
+  }
+  return undefined;
+}
 
 /**
  * Executes one test against a page from a fresh browser context.
@@ -221,6 +264,7 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
     mask = (s: string) => s,
     snapshot,
     maxSnapshotLines,
+    renderWatchMs = RENDER_WATCH_MS,
     onEvent = () => {},
   } = options;
   // The default snapshotter alone honours `maxSnapshotLines`; an injected fake
@@ -269,6 +313,10 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
     let failedAttempts = 0;
     let lastResult: string | undefined;
     let stepFailedReason: string | undefined;
+    // The last snapshot this step read, so a failure on a cut one can say so.
+    let lastSnapshot: string | undefined;
+    // Whether this step's one look at a page still rendering has been spent.
+    let lookedAgain = false;
     // One instance per step: constructing it here IS the "does not cross steps"
     // rule (design contained-recovery, D1) — there is no reset to forget. The
     // step's own text is its first readable source: a value the step names is
@@ -306,6 +354,7 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
           );
         }
         const snap = await takeSnapshot(page);
+        lastSnapshot = snap;
         // Recorded at the one point a snapshot crosses into a prompt, masked
         // exactly as the model receives it (design refuse-an-invented-value,
         // D2/D4): what the model was shown is what it may quote from, and a
@@ -352,6 +401,9 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
           continue;
         }
         iterations++;
+        // Set when a `done` is judged as an `assert`: the record still shows a `done`.
+        let judgingDone = false;
+        const shown = (): AgentAction => (judgingDone ? { ...action, action: 'done' } : action);
 
         if (action.action === 'done') {
           // A step closes on what was done, not on being declared done (design
@@ -377,11 +429,35 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
             }
             continue;
           }
-          emitAction(index, action, action.reasoning);
-          break;
+          if (!recovery.checksAfterActing) {
+            emitAction(index, action, action.reasoning);
+            break;
+          }
+          // A step that acts and then asks for a check closes on a judgment
+          // (design judge-a-done-that-closes-a-check, D1): the `done`'s
+          // sentence about the page is the claim, decided below exactly as an
+          // `assert`'s is, re-observation included. Otherwise the check is the
+          // acting model's word alone (#172).
+          judgingDone = true;
+          action = { ...action, action: 'assert', expectation: action.reasoning };
         }
 
         if (action.action === 'fail') {
+          // A `fail` with nothing done may have been decided on a page still
+          // rendering (design look-again-before-failing-on-a-page-still-rendering,
+          // D2): nothing the step did can explain what it saw. Once per step,
+          // and a still page costs no model call.
+          if (!recovery.acted && !lookedAgain) {
+            lookedAgain = true;
+            const moved = await pageChangedWithin(page, takeSnapshot, (snap) => withoutRefs(mask(snap)), pageSnap, renderWatchMs);
+            if (moved !== undefined) {
+              lastSnapshot = moved.raw;
+              recovery.observe(moved.page);
+              lastResult = FAIL_ON_A_CHANGING_PAGE;
+              emitAction(index, action, `${action.reasoning} :: ${FAIL_ON_A_CHANGING_PAGE}`);
+              continue;
+            }
+          }
           emitAction(index, action, action.reasoning);
           throw new StepFailure(action.reasoning);
         }
@@ -422,6 +498,7 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
               // is what let the model invent an action instead of looking again.
               await waitForSettled(page);
               const freshSnap = await takeSnapshot(page);
+              lastSnapshot = freshSnap;
               const maskedFresh = withoutRefs(mask(freshSnap));
               // Every snapshot that crosses into a prompt during this step, not
               // only the ones the acting model sees: the judge's reason comes back
@@ -440,7 +517,7 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
             if (error instanceof RunStoppedError) throw error;
             failedAttempts++;
             lastResult = `error: ${error instanceof Error ? error.message : String(error)}`;
-            emitAction(index, action, lastResult);
+            emitAction(index, shown(), lastResult);
             if (failedAttempts >= maxRetries) {
               throw new StepFailure(lastResult);
             }
@@ -449,7 +526,7 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
           const result = judgment.pass
             ? `ok: assertion passed: ${judgment.reason}`
             : `assertion failed: ${judgment.reason}`;
-          emitAction(index, action, result);
+          emitAction(index, shown(), result);
           if (judgment.pass) {
             // Terminate here, exactly as `done` does. The extra turn this used to
             // spend asking for a further action is what let the model contradict
@@ -532,6 +609,14 @@ export async function executeTest(page: PageLike, test: TestFile, options: Execu
       if (error instanceof RunStoppedError) throw error;
       // Mask everything that reaches logs/reports, regardless of throw site.
       stepFailedReason = mask(error instanceof Error ? error.message : String(error));
+      // A hint, not a verdict change (design keep-the-open-dialog-in-the-snapshot,
+      // D3): a false FAIL caused by the cap should read as one in the report.
+      const cutAt = lastSnapshot === undefined ? undefined : snapshotCutAt(lastSnapshot);
+      if (cutAt !== undefined) {
+        stepFailedReason +=
+          ` (The page's snapshot was cut at max_snapshot_lines (${cutAt}); ` +
+          'what the step looks for may be in the part left out.)';
+      }
     }
 
     // Only actions that succeeded are recorded, so "used" means performed.

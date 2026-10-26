@@ -144,7 +144,7 @@ steps:
   - complete checkout
 ```
 
-`priority` is P0–P2 (default P1). `tags`, `setup` steps and `auth` are optional — `auth: false` runs the test signed out, which a login test needs, and a selection in which *every* test declares it skips the login altogether. `routes` declares the URLs a test covers, which is what `--impacted` selects on; write route strings consistently, since they compare by exact equality (`/cart` ≠ `/cart/`). `run` warns to stderr — non-fatal — when a test declares a route no `routes:` mapping declares, since that route contributes nothing to `--impacted` selection.
+`priority` is P0–P2 (default P1). `tags`, `setup` steps, `auth` and `device` are optional — `auth: false` runs the test signed out, which a login test needs, and a selection in which *every* test declares it skips the login altogether. `device: Pixel 7` runs the test as a phone from [Playwright's device list](docs/configuration.md#device), so a responsive app's mobile interface can be tested beside its desktop one. `routes` declares the URLs a test covers, which is what `--impacted` selects on; write route strings consistently, since they compare by exact equality (`/cart` ≠ `/cart/`). `run` warns to stderr — non-fatal — when a test declares a route no `routes:` mapping declares, since that route contributes nothing to `--impacted` selection.
 
 ### Say what each step should produce
 
@@ -255,7 +255,7 @@ blastproof run                   # any failure exits 1 (strict, the default)
 blastproof run --min-score 80    # one failing P2 is tolerated
 ```
 
-`--min-score` **replaces** the all-must-pass rule rather than adding to it. Only executed tests count: filtered and unrouted tests are neither numerator nor denominator, and a run that executed nothing scores 100, so a docs-only PR is never blocked. JUnit carries the score as a `<property name="score">`, and unrouted tests appear as `<skipped/>` so the coverage gap shows up in CI rather than vanishing.
+`--min-score` **replaces** the all-must-pass rule rather than adding to it. Only executed tests count: filtered and unrouted tests are neither numerator nor denominator, and a run that executed nothing scores 100, so a docs-only PR is never blocked. JUnit carries the score as a `<property name="score">`, and unrouted tests appear as `<skipped/>` so the coverage gap shows up in CI rather than vanishing. The warnings the run prints (uncommitted work, route drift, a step that names no value) are in both reports too: JUnit counts them in `<property name="warnings">` with their text in `<system-err>`, and the HTML report shows them right after the score.
 
 **The verdict behind that number is pinned, and that is not the same as reproducible.** The model call that decides whether a step passed runs at temperature 0, so the same page and the same expectation are not re-sampled into a different answer — a gate that flips on identical input teaches people to re-run until green, which is worse than no gate. What pinning does not survive: provider-side batching, floating point, and a gateway routing two calls to different providers or quantizations. Expect far less variance, not a guarantee of the same output twice.
 

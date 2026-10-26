@@ -7,6 +7,19 @@ while it is pre-1.0, a minor bump may change existing behaviour and a patch neve
 
 ### Added
 
+- **The reports carry the warnings** ([#103](https://github.com/hamc/blastproof/issues/103)).
+  Uncommitted work `--impacted` did not see, route drift, a step that names no value and a
+  secret the page returned reformatted were printed to stderr only, so a reviewer reading the
+  CI artifacts saw the score without the caveat on it. JUnit now counts them in a `warnings`
+  property, with their text in the suite's `<system-err>`, and the HTML report shows them right
+  after the score. The terminal, the exit code and the selection are unchanged.
+
+## [0.28.0] — 2026-10-25
+
+Minor: two new options, both off by default. A config without them runs exactly as before.
+
+### Added
+
 - **An opt-in decision model in front of the judge** (experimental, [#184](https://github.com/hamc/blastproof/issues/184)).
   `first_judge: { model: liquid/d1-ultra }`, or `BLASTPROOF_FIRST_JUDGE_MODEL`, asks a model on
   OpenRouter's Decisions API first. At a probability of 0.7 or more the step passes without an LLM
@@ -15,6 +28,12 @@ while it is pre-1.0, a minor bump may change existing behaviour and a patch neve
   call. The summary counts what it passed and what it sent on, and `first-judge.jsonl` keeps the
   page and the probability behind every decision, since a pass from it has no reason. Off by
   default.
+- **Tests on a phone** ([#163](https://github.com/hamc/blastproof/issues/163)). `browser.device`
+  names a device from Playwright's registry (`Pixel 7`, `iPhone 15`) and every test runs at its
+  screen size, user agent and touch; a test file's own `device:` wins over it, so desktop and
+  mobile journeys share one suite and one run. `BLASTPROOF_BROWSER_DEVICE` sets it for one run. An
+  unknown name is a configuration error suggesting the closest ones. The run log and the HTML
+  report name a test's device. Emulated in Chromium: an iPhone's screen, not Safari's engine.
 
 ### Tests
 
@@ -22,10 +41,12 @@ while it is pre-1.0, a minor bump may change existing behaviour and a patch neve
   or a moved decimal point, a cart total 60 cents high, an order dated a day late, and two orders
   showing each other's dates or totals. The dogfood suite gains `orders-detail.yaml`, which checks
   each order's date and total.
+- The demo app shows a menu button instead of its links at phone width, and the dogfood suite gains
+  `mobile-menu.yaml`, which runs as a Pixel 7 and fails on the desktop.
 
 ### Documentation
 
-- Two decision models measured as a first judge: `typesafe/jev-1.13` and `liquid/d1-ultra`, in front of the LLM judge at a threshold of 0.7 with the label check on, let no planted bug through in 162 runs, and made every run on a real app cheaper and faster: 15 to 17% and 11 to 13% on average. Judged on the same pages, `d1-ultra` agreed with `claude-haiku-5.5` on 494 of 501 judgments, and the LLM was wrong on the other 7. The record moves to `docs/model-evaluations/decision-models.md`; an opt-in option is planned ([#184](https://github.com/hamc/blastproof/issues/184)).
+- Two decision models measured as a first judge: `typesafe/jev-1.13` and `liquid/d1-ultra`, in front of the LLM judge at a threshold of 0.7 with the label check on, let no planted bug through in 162 runs, and made every run on a real app cheaper and faster: 15 to 17% and 11 to 13% on average. Judged on the same pages, `d1-ultra` agreed with `claude-haiku-5.5` on 494 of 501 judgments, and the LLM was wrong on the other 7. The record moves to `docs/model-evaluations/decision-models.md`; the option it led to is `first_judge`, above.
 - Jev measured as the judge in whole runs, and not adopted: alone, it failed a correct test in every run on a real app; as a first pass in front of the LLM judge, it was as accurate, 13% cheaper and 7% faster, but a pass it gives has no reason, and its documented weaknesses (numbers, dates) are untested here ([#174](https://github.com/hamc/blastproof/issues/174)).
 
 ## [0.27.0] — 2026-10-13
